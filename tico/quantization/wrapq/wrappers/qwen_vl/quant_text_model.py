@@ -288,10 +288,9 @@ class QuantQwen3VLTextModel(QuantModuleBase):
             text_position_ids = position_ids[0]
 
         # Build causal mask if not provided (or provided as bool)
-        if attention_mask is None or attention_mask.dtype == torch.bool:
-            attention_mask = self._slice_causal(
-                inputs_embeds.shape[1], inputs_embeds.device
-            )
+        attention_mask = self._slice_causal(
+            inputs_embeds.shape[1], inputs_embeds.device
+        )
             # from transformers.masking_utils import create_causal_mask
             # attention_mask = create_causal_mask(
             #    config=self.config,

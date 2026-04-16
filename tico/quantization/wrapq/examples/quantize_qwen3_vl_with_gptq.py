@@ -18,16 +18,23 @@ import io
 from typing import Any, Optional
 
 import torch
+import tqdm
 from transformers import AutoProcessor
 
 from tico.quantization import convert, prepare
 from tico.quantization.algorithm.gptq.utils import SensitivityCalibrator
+from tico.quantization.config.builders import build_qwen3_vl_ptq_config
 from tico.quantization.config.qwen3_vl_gptq import Qwen3VLGPTQConfig
 from tico.quantization.evaluation.vlm_eval_utils import (
     get_accuracy_on_dataset,
     get_calib_inputs,
     get_dataset,
 )
+from tico.quantization.wrapq.dtypes import DType
+from tico.quantization.wrapq.observers.affine_base import AffineObserverBase
+from tico.quantization.wrapq.qscheme import QScheme
+from tico.quantization.wrapq.wrappers.quant_module_base import QuantModuleBase
+
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -195,9 +202,117 @@ def print_markdown_comparison(
     print(quantized_row)
 
 
+# -------------------------------------------------------------------------
+# Helper — copy GPTQ (scale, zp) into PTQ observers
+# -------------------------------------------------------------------------
+def inject_gptq_qparams(
+    root: torch.nn.Module,
+    gptq_quantizers: dict[str, Any],  # {fp_name: quantizer}
+    weight_obs_name: str = "weight",
+):
+    """
+    For every `QuantModuleBase` whose `fp_name` matches a GPTQ key,
+    locate the observer called `weight_obs_name` and overwrite its
+    (scale, zero-point), then lock them against further updates.
+    """
+    for m in root.modules():
+        if not isinstance(m, QuantModuleBase):
+            continue
+        if m.fp_name is None:
+            continue
+
+        gptq_key = m.fp_name
+        if gptq_key.startswith("model."):
+            gptq_key = gptq_key[len("model."):]  # Remove "model." prefix which comes from `QuantQwen3VLForConditionalGeneration` wrapper
+
+        quantizer = gptq_quantizers.get(gptq_key)
+        if quantizer is None:
+            continue
+        obs = m.get_observer(weight_obs_name)
+        if obs is None:
+            continue
+        assert isinstance(obs, AffineObserverBase)
+        # GPTQ quantizer attributes
+        obs.load_qparams(quantizer.scale, quantizer.zero, lock=True)
+
+def quantize_using_PTQ(
+    q_m,
+    calib_inputs,
+    args,
+    num_vision_blocks: int,
+    num_text_layers: int,
+    num_deepstack_mergers: int = 0,
+):
+    """
+    Wrap model with PTQWrapper and calibrate activation observers.
+
+    Args:
+        q_m: Model after GPTQ quantization.
+        calib_inputs: Calibration inputs for PTQ calibration.
+        args: Command-line arguments.
+        num_vision_blocks: Number of vision transformer blocks.
+        num_text_layers: Number of text decoder layers.
+        num_deepstack_mergers: Number of deepstack merger modules.
+
+    Returns:
+        PTQ-quantized model.
+    """
+    print("Wrapping model with PTQWrapper …")
+
+    qcfg = build_qwen3_vl_ptq_config(
+        num_vision_blocks=num_vision_blocks,
+        num_text_layers=num_text_layers,
+        num_deepstack_mergers=num_deepstack_mergers,
+        activation_dtype=DType.int(16),
+        default_qscheme=QScheme.PER_TENSOR_SYMM,
+        linear_weight_bits=args.linear_weight_bits,
+        vision_patch_embed_weight_bits=args.vision_patch_embed_weight_bits,
+        embedding_weight_bits=args.embedding_weight_bits,
+        lm_head_weight_bits=args.lm_head_weight_bits,
+        norm_weight_dtype=DType.int(16),
+        quantize_vision=args.quantize_vision,
+        quantize_text=args.quantize_text,
+        quantize_lm_head=args.quantize_lm_head,
+        strict_wrap=True,
+    )
+
+    q_m = prepare(q_m, qcfg)
+
+    # -------------------------------------------------------------------------
+    # Single-pass activation calibration
+    # -------------------------------------------------------------------------
+    print("Calibrating PTQ observers…")
+
+    # Overwrite weight observers with GPTQ statistics
+    if hasattr(q_m, "quantizers") and isinstance(q_m.quantizers, dict):
+        inject_gptq_qparams(q_m, q_m.quantizers)
+    elif (
+        hasattr(q_m, "wrapped")
+        and hasattr(q_m.wrapped, "module")
+        and hasattr(q_m.wrapped.module, "quantizers")
+        and isinstance(q_m.wrapped.module.quantizers, dict)
+    ):
+        inject_gptq_qparams(q_m.wrapped, q_m.wrapped.module.quantizers)
+    else:
+        print(
+            "[Warn] q_m.quantizers not found or not a dict; skipping GPTQ qparam injection."
+        )
+
+    device = torch.device(args.device)
+    with torch.no_grad():
+        for inp in tqdm.tqdm(calib_inputs):
+            dev_inp = move_batch_to_device(inp, args.device)
+            #print (dev_inp)
+            q_m(**dev_inp)
+
+    # Freeze all Q-params (scale, zero-point)
+    q_m = convert(q_m)
+
+    return q_m
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Qwen3-VL GPTQ pipeline (architecture-aware, stagewise)"
+        description="Qwen3-VL GPTQ+PTQ pipeline (architecture-aware, stagewise)"
     )
     parser.add_argument(
         "--model",
@@ -241,6 +356,12 @@ def main() -> None:
         help="Skip GPTQ and keep the model in floating-point.",
     )
     parser.add_argument(
+        "--no_PTQ",
+        action="store_true",
+        default=False,
+        help="Skip PTQ activation quantization.",
+    )
+    parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
@@ -281,6 +402,24 @@ def main() -> None:
         type=int,
         default=4,
         help="Weight bit-width for GPTQ quantization.",
+    )
+    parser.add_argument(
+        "--vision_patch_embed_weight_bits",
+        type=int,
+        default=8,
+        help="Number of bits for vision patch embedding (Conv3d) quantization.",
+    )
+    parser.add_argument(
+        "--embedding_weight_bits",
+        type=int,
+        default=8,
+        help="Number of bits for input Embedding quantization.",
+    )
+    parser.add_argument(
+        "--lm_head_weight_bits",
+        type=int,
+        default=4,
+        help="Number of bits for lm_head quantization.",
     )
     parser.add_argument(
         "--gptq_mse",
@@ -384,6 +523,8 @@ def main() -> None:
     print(f"Quantize vision  : {quantize_vision}")
     print(f"Quantize text    : {quantize_text}")
     print(f"Quantize lm_head : {quantize_lm_head}")
+    print(f"Use GPTQ         : {not args.no_GPTQ}")
+    print(f"Use PTQ          : {not args.no_PTQ}")
     print()
 
     print("Loading FP model …")
@@ -422,6 +563,11 @@ def main() -> None:
 
     model.eval()
 
+    if args.calib_seq_len is not None:
+        model.config.text_config.max_position_embeddings = min(
+            model.config.text_config.max_position_embeddings, args.calib_seq_len
+        )
+
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
     if hasattr(model, "config") and hasattr(model.config, "text_config"):
@@ -438,6 +584,7 @@ def main() -> None:
             max_seq_len=args.max_seq_len,
         )
         print_eval_results("Evaluating original model", original_results)
+
 
     calib_inputs = get_calib_inputs(
         "vqav2",
@@ -490,6 +637,63 @@ def main() -> None:
         q_m = convert(q_m, inplace=True)
     else:
         q_m = model
+
+    # -------------------------------------------------------------------------
+    # Wrap with PTQ for activation quantization
+    # -------------------------------------------------------------------------
+    if not args.no_PTQ:
+        # Get number of vision blocks from model config
+        if hasattr(q_m, "config") and hasattr(q_m.config, "vision_config"):
+            vision_config = q_m.config.vision_config
+            if hasattr(vision_config, "num_hidden_layers"):
+                num_vision_blocks = vision_config.num_hidden_layers
+            elif hasattr(vision_config, "num_layers"):
+                num_vision_blocks = vision_config.num_layers
+            elif hasattr(vision_config, "depth"):
+                num_vision_blocks = vision_config.depth
+            else:
+                raise ValueError(
+                    "Cannot determine num_vision_blocks from vision_config. "
+                    "Expected vision_config.num_hidden_layers, num_layers, or depth."
+                )
+        else:
+            raise ValueError(
+                "Cannot determine num_vision_blocks from model config. "
+                "Please ensure the model has config.vision_config."
+            )
+
+        # Get number of text layers from model config
+        if hasattr(q_m, "config") and hasattr(q_m.config, "text_config"):
+            num_text_layers = q_m.config.text_config.num_hidden_layers
+        elif hasattr(q_m, "config") and hasattr(q_m.config, "num_hidden_layers"):
+            num_text_layers = q_m.config.num_hidden_layers
+        else:
+            raise ValueError(
+                "Cannot determine num_text_layers from model config. "
+                "Please ensure the model has config.text_config.num_hidden_layers "
+                "or config.num_hidden_layers."
+            )
+
+        # Get number of deepstack mergers from model config
+        num_deepstack_mergers = 0
+        if hasattr(q_m, "config") and hasattr(q_m.config, "vision_config"):
+            vision_config = q_m.config.vision_config
+            if hasattr(vision_config, "deepstack_visual_indexes"):
+                num_deepstack_mergers = len(vision_config.deepstack_visual_indexes)
+
+        print(
+            f"Vision blocks: {num_vision_blocks}, "
+            f"Text layers: {num_text_layers}, "
+            f"Deepstack mergers: {num_deepstack_mergers}"
+        )
+        q_m = quantize_using_PTQ(
+            q_m,
+            calib_inputs,
+            args,
+            num_vision_blocks,
+            num_text_layers,
+            num_deepstack_mergers,
+        )
 
     if args.eval_tasks is not None:
         quantized_results = evaluate_model(
