@@ -678,12 +678,12 @@ def _build_qwen3_vl_overrides(
         # Vision blocks
         vision_overrides["blocks"] = {}
         for block_idx in range(num_vision_blocks):
-            vision_overrides["blocks"][str(block_idx)] = (
-                _build_qwen3_vl_vision_block_overrides(
-                    linear_weight_dtype=linear_weight_dtype,
-                    norm_dtype=norm_dtype,
-                    norm_weight_dtype=norm_weight_dtype,
-                )
+            vision_overrides["blocks"][
+                str(block_idx)
+            ] = _build_qwen3_vl_vision_block_overrides(
+                linear_weight_dtype=linear_weight_dtype,
+                norm_dtype=norm_dtype,
+                norm_weight_dtype=norm_weight_dtype,
             )
 
         # Merger (has norm, linear_fc1, linear_fc2)
@@ -704,9 +704,9 @@ def _build_qwen3_vl_overrides(
                 norm_weight_dtype=norm_weight_dtype,
             )
             for merger_idx in range(num_deepstack_mergers):
-                vision_overrides["deepstack_merger_list"][str(merger_idx)] = (
-                    copy.deepcopy(deepstack_override)
-                )
+                vision_overrides["deepstack_merger_list"][
+                    str(merger_idx)
+                ] = copy.deepcopy(deepstack_override)
 
         overrides["model"]["visual"] = vision_overrides
 
@@ -722,12 +722,12 @@ def _build_qwen3_vl_overrides(
         # Text layers
         text_overrides["layers"] = {}
         for layer_idx in range(num_text_layers):
-            text_overrides["layers"][str(layer_idx)] = (
-                _build_qwen3_vl_text_layer_overrides(
-                    linear_weight_dtype=linear_weight_dtype,
-                    norm_dtype=norm_dtype,
-                    norm_weight_dtype=norm_weight_dtype,
-                )
+            text_overrides["layers"][
+                str(layer_idx)
+            ] = _build_qwen3_vl_text_layer_overrides(
+                linear_weight_dtype=linear_weight_dtype,
+                norm_dtype=norm_dtype,
+                norm_weight_dtype=norm_weight_dtype,
             )
 
         # Final norm
@@ -861,7 +861,7 @@ def build_qwen3_vl_ptq_config(
         quantize_lm_head=quantize_lm_head,
     )
 
-     # Set default model_args if not provided
+    # Set default model_args if not provided
     if model_args is None:
         model_args = {
             "vision": {

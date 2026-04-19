@@ -383,17 +383,16 @@ class QuantQwen3VLVisionModel(QuantModuleBase):
         Returns:
             BaseModelOutputWithDeepstackFeatures or similar
         """
-        #vision_output = self.module(hidden_states, grid_thw=grid_thw, **kwargs)
-        #return vision_output
-
         # Model export mode (torch.export.export) requires the use of fixed precomputed values (`grid_thw`,`position_embeddings`,`cu_seqlens').
         # `torch.compiler.is_compiling()` controls the conditional behavior of the model:
         # - precomputed values are used in export mode
         # - otherwise, the calculation is performed dynamically(e.g. benchmarks evaluation)
         if torch.compiler.is_compiling():
             # Assert that grid_thw matches the precomputed vision_grid_thw
-            if self._mode is Mode.CALIB:
-                assert torch.equal(grid_thw, self.vision_grid_thw.to(grid_thw.device)), (
+            if self._mode is Mode.QUANT:
+                assert torch.equal(
+                    grid_thw, self.vision_grid_thw.to(grid_thw.device)
+                ), (
                     f"grid_thw {grid_thw.tolist()} does not match the precomputed "
                     f"vision_grid_thw {self.vision_grid_thw.tolist()}"
                 )
@@ -422,7 +421,7 @@ class QuantQwen3VLVisionModel(QuantModuleBase):
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
 
-        #RoPE position embeddings (cos, sin)
+        # RoPE position embeddings (cos, sin)
         if torch.compiler.is_compiling():
             # Use precomputed RoPE position embeddings (cos, sin) and quantize
             cos = self.rope_cos_template.to(

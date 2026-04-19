@@ -223,7 +223,9 @@ def inject_gptq_qparams(
 
         gptq_key = m.fp_name
         if gptq_key.startswith("model."):
-            gptq_key = gptq_key[len("model."):]  # Remove "model." prefix which comes from `QuantQwen3VLForConditionalGeneration` wrapper
+            gptq_key = gptq_key[
+                len("model.") :
+            ]  # Remove "model." prefix which comes from `QuantQwen3VLForConditionalGeneration` wrapper
 
         quantizer = gptq_quantizers.get(gptq_key)
         if quantizer is None:
@@ -234,6 +236,7 @@ def inject_gptq_qparams(
         assert isinstance(obs, AffineObserverBase)
         # GPTQ quantizer attributes
         obs.load_qparams(quantizer.scale, quantizer.zero, lock=True)
+
 
 def quantize_using_PTQ(
     q_m,
@@ -302,13 +305,13 @@ def quantize_using_PTQ(
     with torch.no_grad():
         for inp in tqdm.tqdm(calib_inputs):
             dev_inp = move_batch_to_device(inp, args.device)
-            #print (dev_inp)
             q_m(**dev_inp)
 
     # Freeze all Q-params (scale, zero-point)
     q_m = convert(q_m)
 
     return q_m
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(

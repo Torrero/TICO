@@ -253,11 +253,17 @@ class TestQuantQwen3VLVisionModel(unittest.TestCase):
         )
         q_model.enable_calibration()
 
-        # Try with different grid
-        hidden_states, grid_thw = self._create_test_inputs((1, 4, 4))
+        # Calibration input
+        hidden_states, grid_thw = self._create_test_inputs((1, 8, 8))
+        # Run calibration
+        q_model(hidden_states, grid_thw)
+        q_model.freeze_qparams()
 
+        compiled_model = torch.compile(q_model)
+        # Try with different grid
+        hidden_states_chg, grid_thw_chg = self._create_test_inputs((1, 4, 4))
         with self.assertRaises(AssertionError) as context:
-            _ = q_model(hidden_states, grid_thw)
+            compiled_model(hidden_states_chg, grid_thw_chg)
         self.assertIn("grid_thw", str(context.exception))
 
     def test_observer_count(self):
