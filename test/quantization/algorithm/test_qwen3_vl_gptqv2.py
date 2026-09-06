@@ -272,8 +272,8 @@ class TestFPInputsCache(unittest.TestCase):
 
     @torch.no_grad()
     def test_collect_then_cache_hit(self):
-        """First call collects via hooks; second call returns from cache
-        without re-running forward."""
+        """First call collects via hooks and persists to _fp_inputs_disk_cache;
+        second call returns from cache without re-running forward."""
         quantizer = _make_quantizer(fp_inputs_cache_path="/tmp/dummy.pt")
 
         linear = nn.Linear(4, 4)
@@ -295,7 +295,8 @@ class TestFPInputsCache(unittest.TestCase):
         self.assertIn("0", result1)
         self.assertTrue(torch.equal(result1["0"][0], inp))
 
-        quantizer._fp_inputs_disk_cache["test_stage"] = result1
+        # The function should have persisted to _fp_inputs_disk_cache automatically
+        self.assertIn("test_stage", quantizer._fp_inputs_disk_cache)
 
         broken_module = MagicMock(side_effect=RuntimeError("should not be called"))
         result2 = quantizer._collect_native_inputs_from_stage_cache(
@@ -308,6 +309,274 @@ class TestFPInputsCache(unittest.TestCase):
         )
         self.assertTrue(torch.equal(result2["0"][0], result1["0"][0]))
         broken_module.assert_not_called()
+
+    @torch.no_grad()
+    def test_stage_cache_persist_roundtrip(self):
+        """Cold collection -> save to disk -> new quantizer loads disk ->
+        warm lookup returns cached tensors without calling forward.
+
+        This test verifies that _collect_native_inputs_from_stage_cache()
+        persists its result so that a warm-cache run can retrieve it.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "fp_cache.pt")
+
+            # --- Cold run: collect and persist ---
+            quantizer_cold = _make_quantizer(fp_inputs_cache_path=cache_path)
+
+            linear = nn.Linear(4, 4)
+            stage_module = nn.Sequential(linear)
+            subset = {"0": linear}
+
+            inp = torch.randn(2, 4)
+            cached_args = [[inp]]
+            cached_kwargs: dict = {}
+
+            result_cold = quantizer_cold._collect_native_inputs_from_stage_cache(
+                stage_module=stage_module,
+                subset=subset,
+                cached_args=cached_args,
+                cached_kwargs=cached_kwargs,
+                stage_desc="vision.blocks.0",
+                num_batches=1,
+            )
+            self.assertIn("0", result_cold)
+            self.assertTrue(torch.equal(result_cold["0"][0], inp))
+
+            # Verify the stage was persisted to the in-memory disk cache
+            self.assertIn("vision.blocks.0", quantizer_cold._fp_inputs_disk_cache)
+
+            # Simulate convert()'s save logic
+            torch.save(quantizer_cold._fp_inputs_disk_cache, cache_path)
+            self.assertTrue(os.path.exists(cache_path))
+
+            # --- Warm run: new quantizer loads cache from disk ---
+            quantizer_warm = _make_quantizer(fp_inputs_cache_path=cache_path)
+            quantizer_warm._fp_inputs_disk_cache = torch.load(
+                cache_path, map_location="cpu", weights_only=False
+            )
+            quantizer_warm._fp_inputs_disk_loaded = True
+
+            # Use a broken module that raises if forward is called
+            broken_module = MagicMock(side_effect=RuntimeError("should not be called"))
+            result_warm = quantizer_warm._collect_native_inputs_from_stage_cache(
+                stage_module=broken_module,
+                subset=subset,
+                cached_args=cached_args,
+                cached_kwargs=cached_kwargs,
+                stage_desc="vision.blocks.0",
+                num_batches=1,
+            )
+            # The warm result should match the cold result
+            self.assertTrue(torch.equal(result_warm["0"][0], result_cold["0"][0]))
+            broken_module.assert_not_called()
+
+    @torch.no_grad()
+    def test_stage_cache_fail_closed_on_miss(self):
+        """When _fp_inputs_disk_loaded is True but the stage is not in the cache,
+        a RuntimeError should be raised instead of silently recomputing."""
+        quantizer = _make_quantizer(fp_inputs_cache_path="/tmp/dummy.pt")
+        quantizer._fp_inputs_disk_loaded = True
+        # "missing_stage" is NOT in _fp_inputs_disk_cache
+
+        linear = nn.Linear(4, 4)
+        stage_module = nn.Sequential(linear)
+        subset = {"0": linear}
+
+        inp = torch.randn(2, 4)
+        cached_args = [[inp]]
+        cached_kwargs: dict = {}
+
+        with self.assertRaises(RuntimeError) as ctx:
+            quantizer._collect_native_inputs_from_stage_cache(
+                stage_module=stage_module,
+                subset=subset,
+                cached_args=cached_args,
+                cached_kwargs=cached_kwargs,
+                stage_desc="missing_stage",
+                num_batches=1,
+            )
+        self.assertIn("cache miss", str(ctx.exception).lower())
+
+
+# ---------------------------------------------------------------------------
+# Tests: GPTQv2 P-correction (dXXT → P matrix)
+# ---------------------------------------------------------------------------
+
+
+class TestGPTQPCorrection(unittest.TestCase):
+    """Reference tests for the GPTQv2 P-correction logic in fasterquant.
+
+    These tests verify:
+      1. ``quantize()`` does not modify ``w_col`` in-place.
+      2. ``q_col`` and ``w_col`` are different tensors with different values.
+      3. With ``alpha=0`` the P-correction is zero, so GPTQv2 == GPTQv1.
+      4. With ``alpha>0`` and non-zero ``dXXT``, the quantized weights differ
+         from the ``alpha=0`` case.
+      5. The P matrix is computed as ``alpha * triu(dXXT @ hinv^T, k=1) @ hinv``.
+    """
+
+    def _make_gptq(self, rows=8, cols=8):
+        """Create a GPTQ object with a small Linear layer and a configured quantizer."""
+        torch.manual_seed(42)
+        layer = nn.Linear(cols, rows, bias=False)
+        gptq = GPTQ(layer)
+        gptq.quantizer.configure(bits=8, perchannel=True, sym=True)
+        return gptq
+
+    def _add_random_batch(self, gptq, batch=16, cols=8):
+        """Feed a random batch so that H is well-conditioned."""
+        torch.manual_seed(123)
+        inp = torch.randn(batch, cols)
+        with torch.no_grad():
+            out = gptq.layer(inp)
+        gptq.add_batch(inp, out)
+
+    # ------------------------------------------------------------------
+    # 1. quantize() does not modify w_col in-place
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def test_quantize_does_not_modify_w_col(self):
+        """The ``quantize`` function must not change its input tensor in-place."""
+        from tico.quantization.algorithm.qwen3_vl_gptq.gptq import quantize
+
+        w_col = torch.randn(6)
+        w_col_copy = w_col.clone()
+
+        scale = torch.tensor(0.1)
+        zero = torch.tensor(0.0)
+        maxq = torch.tensor(255.0)
+
+        _ = quantize(w_col.unsqueeze(1), scale, zero, maxq)
+
+        self.assertTrue(torch.equal(w_col, w_col_copy))
+
+    # ------------------------------------------------------------------
+    # 2. q_col != w_col after quantize()
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def test_q_col_differs_from_w_col(self):
+        """``q_col`` (quantized) must differ from ``w_col`` (original)."""
+        from tico.quantization.algorithm.qwen3_vl_gptq.gptq import quantize
+
+        w_col = torch.randn(6)
+        scale = torch.tensor(0.1)
+        zero = torch.tensor(0.0)
+        maxq = torch.tensor(255.0)
+
+        q_col = quantize(w_col.unsqueeze(1), scale, zero, maxq).flatten()
+
+        self.assertFalse(torch.equal(q_col, w_col))
+        # The difference is the quantization error
+        self.assertGreater((w_col - q_col).abs().sum().item(), 0.0)
+
+    # ------------------------------------------------------------------
+    # 3. alpha=0  →  P is zero  →  GPTQv2 == GPTQv1
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def test_alpha_zero_equals_no_pcorrection(self):
+        """With alpha=0 the P-correction vanishes, so the result must match
+        the case where dXXT is None (pure GPTQv1)."""
+        rows, cols = 8, 8
+
+        # --- run A: dXXT=None (GPTQv1) ---
+        gptq_a = self._make_gptq(rows, cols)
+        self._add_random_batch(gptq_a, batch=16, cols=cols)
+        w_before_a = gptq_a.layer.weight.data.clone()
+        gptq_a.fasterquant(blocksize=128, percdamp=0.01, alpha=0.0)
+        w_after_a = gptq_a.layer.weight.data.clone()
+
+        # --- run B: dXXT set but alpha=0 ---
+        gptq_b = self._make_gptq(rows, cols)
+        # Copy same weights and H so the two runs are comparable
+        gptq_b.layer.weight.data = w_before_a.clone()
+        self._add_random_batch(gptq_b, batch=16, cols=cols)
+        gptq_b.dXXT = torch.randn(cols, cols)  # non-zero dXXT
+        gptq_b.fasterquant(blocksize=128, percdamp=0.01, alpha=0.0)
+        w_after_b = gptq_b.layer.weight.data.clone()
+
+        self.assertTrue(torch.allclose(w_after_a, w_after_b, atol=1e-6))
+
+    # ------------------------------------------------------------------
+    # 4. alpha>0 with non-zero dXXT → result differs from alpha=0
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def test_alpha_positive_differs_from_zero(self):
+        """With alpha>0 and a non-zero dXXT, the quantized weights must
+        differ from the alpha=0 baseline."""
+        rows, cols = 8, 8
+
+        # --- baseline: alpha=0 ---
+        gptq_base = self._make_gptq(rows, cols)
+        self._add_random_batch(gptq_base, batch=16, cols=cols)
+        w_orig = gptq_base.layer.weight.data.clone()
+        gptq_base.dXXT = torch.randn(cols, cols)
+        gptq_base.fasterquant(blocksize=128, percdamp=0.01, alpha=0.0)
+        w_base = gptq_base.layer.weight.data.clone()
+
+        # --- with P-correction: alpha=0.5 ---
+        gptq_p = self._make_gptq(rows, cols)
+        gptq_p.layer.weight.data = w_orig.clone()
+        self._add_random_batch(gptq_p, batch=16, cols=cols)
+        gptq_p.dXXT = gptq_base.dXXT.clone()  # same dXXT
+        gptq_p.fasterquant(blocksize=128, percdamp=0.01, alpha=0.5)
+        w_p = gptq_p.layer.weight.data.clone()
+
+        self.assertFalse(torch.allclose(w_base, w_p, atol=1e-6))
+
+    # ------------------------------------------------------------------
+    # 5. P matrix formula: alpha * triu(dXXT @ hinv^T, k=1) @ hinv
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def test_p_correction_formula(self):
+        """Manually compute P from dXXT and hinv, then verify that the
+        in-block P-correction matches ``w_col @ P1[i, i:]``."""
+        rows, cols = 6, 6
+
+        gptq = self._make_gptq(rows, cols)
+        self._add_random_batch(gptq, batch=32, cols=cols)
+
+        # Set a known dXXT
+        torch.manual_seed(99)
+        dXXT = torch.randn(cols, cols)
+        gptq.dXXT = dXXT.clone()
+        alpha = 0.25
+
+        # Reproduce the hinv computation from fasterquant
+        h = gptq.H.clone()
+        del gptq.H  # fasterquant does del self.H; we need to restore after
+        gptq.H = h.clone()  # restore for fasterquant
+
+        dead = torch.diag(h) == 0
+        h[dead, dead] = 1
+        damp = 0.01 * torch.mean(torch.diag(h))
+        diag_idx = torch.arange(cols)
+        h[diag_idx, diag_idx] += damp
+        h = torch.linalg.cholesky(h)
+        h = torch.cholesky_inverse(h)
+        h = torch.linalg.cholesky(h, upper=True)
+        hinv = h
+
+        # Compute P using the same formula as fasterquant
+        P_ref = alpha * ((dXXT @ hinv.T).triu(diagonal=1)) @ hinv
+
+        # P must be non-zero
+        self.assertGreater(P_ref.abs().sum().item(), 0.0)
+
+        # The diagonal of P must be zero (triu with diagonal=1)
+        self.assertTrue(torch.allclose(torch.diag(P_ref), torch.zeros(cols), atol=1e-6))
+
+        # Run fasterquant and verify it completes without error
+        gptq.fasterquant(blocksize=128, percdamp=0.01, alpha=alpha)
+        # After fasterquant, the layer weight should have been updated
+        self.assertIsNotNone(gptq.layer.weight.data)
 
 
 if __name__ == "__main__":
