@@ -39,7 +39,23 @@ from tico.utils.validate_args_kwargs import FakeQuantizePerTensorTQParamArgs
 
 
 def get_constant_from_tensor(
-    node: Union[torch.fx.Node, float], ep: ExportedProgram
+    node: Union[torch.fx.Node, float], ep: ExportedProgram, _cache=None
+) -> Union[torch.fx.Node, float]:
+    """Memoizing wrapper around `_get_constant_from_tensor_impl`.
+
+    One cache dict per pass run collapses the repeated scale/zero-point
+    constant-chain walks shared by thousands of fake-quantize nodes.
+    """
+    if _cache is None:
+        return _get_constant_from_tensor_impl(node, ep, _cache)
+    key = node if isinstance(node, float) else node.name
+    if key not in _cache:
+        _cache[key] = _get_constant_from_tensor_impl(node, ep, _cache)
+    return _cache[key]
+
+
+def _get_constant_from_tensor_impl(
+    node: Union[torch.fx.Node, float], ep: ExportedProgram, _cache=None
 ) -> Union[torch.fx.Node, float]:
     """
     There are some nodes that can do constant folding.
@@ -61,8 +77,8 @@ def get_constant_from_tensor(
     assert isinstance(node.target, torch._ops.OpOverload)
     if node.target.__name__ == "mul.Tensor":
         assert len(node.args) == 2
-        x = get_constant_from_tensor(node.args[0], ep)  # type: ignore[arg-type]
-        y = get_constant_from_tensor(node.args[1], ep)  # type: ignore[arg-type]
+        x = get_constant_from_tensor(node.args[0], ep, _cache)  # type: ignore[arg-type]
+        y = get_constant_from_tensor(node.args[1], ep, _cache)  # type: ignore[arg-type]
         return x * y  # type: ignore[operator]
     if node.target.__name__ == "zeros.default":
         assert len(node.args) == 1
@@ -76,14 +92,14 @@ def get_constant_from_tensor(
         assert len(node.args) == 2
         tensor, shape = node.args
         assert shape == [-1]
-        return get_constant_from_tensor(tensor, ep)  # type: ignore[arg-type]
+        return get_constant_from_tensor(tensor, ep, _cache)  # type: ignore[arg-type]
     if node.target.__name__ == "_to_copy.default":
         assert len(node.args) == 1
-        return get_constant_from_tensor(node.args[0], ep)  # type: ignore[arg-type]
+        return get_constant_from_tensor(node.args[0], ep, _cache)  # type: ignore[arg-type]
     if node.target.__name__ == "to.dtype_layout":
-        return get_constant_from_tensor(node.args[0], ep)  # type: ignore[arg-type]
+        return get_constant_from_tensor(node.args[0], ep, _cache)  # type: ignore[arg-type]
     if node.target.__name__ == "to.device":
-        return get_constant_from_tensor(node.args[0], ep)  # type: ignore[arg-type]
+        return get_constant_from_tensor(node.args[0], ep, _cache)  # type: ignore[arg-type]
     if node.target.__name__ == "lift_fresh_copy.default":
         assert len(node.args) == 1
         assert isinstance(node.args[0], torch.fx.Node)
@@ -95,7 +111,7 @@ def get_constant_from_tensor(
         return value
     if node.target.__name__ in ["detach.default", "detach_.default"]:
         assert len(node.args) == 1
-        return get_constant_from_tensor(node.args[0], ep)  # type: ignore[arg-type]
+        return get_constant_from_tensor(node.args[0], ep, _cache)  # type: ignore[arg-type]
 
     raise RuntimeError(f"Not supported node {node.target.__name__}")
 
@@ -191,6 +207,7 @@ class DecomposeFakeQuantizeTensorQParams(PassBase):
         gm = exported_program.graph_module
         g = gm.graph
         qd = torch.ops.quantized_decomposed  # type: ignore[return]
+        _const_cache: dict = {}
         for node in gm.graph.nodes:
             if node.op != "call_function":
                 continue
@@ -204,8 +221,8 @@ class DecomposeFakeQuantizeTensorQParams(PassBase):
                 tensor, s, zp, _, quant_min, quant_max = node.args
                 # Get constant tensors
                 ep = exported_program
-                s_value = get_constant_from_tensor(s, ep)
-                zp_value = get_constant_from_tensor(zp, ep)
+                s_value = get_constant_from_tensor(s, ep, _const_cache)
+                zp_value = get_constant_from_tensor(zp, ep, _const_cache)
                 # This op has one user: `getitem` for the output.
                 # TODO Investigate why the op is generated like this.
                 # node.users = {getitem: None}
@@ -253,8 +270,8 @@ class DecomposeFakeQuantizeTensorQParams(PassBase):
 
                 # Get constant tensors
                 ep = exported_program
-                s_value = get_constant_from_tensor(s, ep)
-                zp_value = get_constant_from_tensor(zp, ep)
+                s_value = get_constant_from_tensor(s, ep, _const_cache)
+                zp_value = get_constant_from_tensor(zp, ep, _const_cache)
                 quant_kwargs = {
                     **node.kwargs,
                     **{"dtype": get_quant_type(quant_min, quant_max)},

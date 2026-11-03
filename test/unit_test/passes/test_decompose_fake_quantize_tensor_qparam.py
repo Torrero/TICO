@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest import mock
+
+import tico.passes.decompose_fake_quantize_tensor_qparams as fq_tqparams_module
 import torch
 from tico.passes.const_prop_pass import ConstPropPass
 from tico.passes.decompose_fake_quantize import DecomposeFakeQuantize
 from tico.passes.decompose_fake_quantize_tensor_qparams import (
     DecomposeFakeQuantizeTensorQParams,
+    get_constant_from_tensor,
 )
 from tico.passes.fill_meta_val import FillMetaVal
 from tico.quantization.passes.fold_quant_ops import FoldQuantOps
@@ -239,3 +243,40 @@ class DecomposeFakeQuantizeTensorQParamsCacheMaskTest(SinglePassValueTest):
                 break
         self.assertIsNotNone(quant_node)
         self.assertEqual(quant_node.kwargs["dtype"], torch.int16)  # type: ignore[union-attr]
+
+
+class GetConstantFromTensorMemoTest(PassTest):
+    def test_cached_wrapper_reuses_values_within_a_run(self):
+        self.setup(FakeQuantizeTensorQParamPerTensor())
+        ep = self.exported_program()
+        fq_node = next(
+            n
+            for n in ep.graph.nodes
+            if n.op == "call_function"
+            and n.target
+            == torch.ops.aten.fake_quantize_per_tensor_affine.tensor_qparams
+        )
+        scale_arg = fq_node.args[1]
+
+        cache = {}
+        with mock.patch.object(
+            fq_tqparams_module,
+            "_get_constant_from_tensor_impl",
+            wraps=fq_tqparams_module._get_constant_from_tensor_impl,
+        ) as impl_spy:
+            cached_value = get_constant_from_tensor(scale_arg, ep, cache)
+            calls_after_first = impl_spy.call_count
+            cached_again = get_constant_from_tensor(scale_arg, ep, cache)
+
+        self.assertEqual(cached_again, cached_value)
+        self.assertEqual(impl_spy.call_count, calls_after_first)
+
+        with mock.patch.object(
+            fq_tqparams_module,
+            "_get_constant_from_tensor_impl",
+            wraps=fq_tqparams_module._get_constant_from_tensor_impl,
+        ) as impl_spy_uncached:
+            uncached_value = get_constant_from_tensor(scale_arg, ep)
+
+        self.assertEqual(uncached_value, cached_value)
+        self.assertGreaterEqual(impl_spy_uncached.call_count, 1)
